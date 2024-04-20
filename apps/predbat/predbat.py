@@ -26,7 +26,7 @@ from multiprocessing import Pool, cpu_count
 if not "PRED_GLOBAL" in globals():
     PRED_GLOBAL = {}
 
-THIS_VERSION = "v7.16.17"
+THIS_VERSION = "v7.16.16"
 PREDBAT_FILES = ["predbat.py"]
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 TIME_FORMAT_SECONDS = "%Y-%m-%dT%H:%M:%S.%f%z"
@@ -417,18 +417,6 @@ CONFIG_ITEMS = [
         "step": 0.05,
         "unit": "*",
         "icon": "mdi:multiplication",
-        "enable": "expert_mode",
-        "default": 0.0,
-    },
-    {
-        "name": "combine_rate_threshold",
-        "friendly_name": "Combine Rate Threshold",
-        "type": "input_number",
-        "min": 0,
-        "max": 5.0,
-        "step": 0.1,
-        "unit": "p",
-        "icon": "mdi:table-merge-cells",
         "enable": "expert_mode",
         "default": 0.0,
     },
@@ -1065,6 +1053,30 @@ INVERTER_DEF = {
         "has_charge_enable_time": False,
         "has_discharge_enable_time": False,
         "has_target_soc": False,
+        "has_reserve_soc": False,
+        "charge_time_format": "S",
+        "charge_time_entity_is_option": False,
+        "soc_units": "%",
+        "num_load_entities": 1,
+        "has_ge_inverter_mode": False,
+        "time_button_press": False,
+        "clock_time_format": "%Y-%m-%d %H:%M:%S",
+        "write_and_poll_sleep": 2,
+        "has_time_window": False,
+        "support_charge_freeze": False,
+        "support_discharge_freeze": False,
+        "has_idle_time": False,
+        "can_span_midnight": True,
+    },
+    "SK": {
+        "name": "Sunsynk",
+        "has_rest_api": False,
+        "has_mqtt_api": False,
+        "has_service_api": True,
+        "output_charge_control": "power",
+        "has_charge_enable_time": False,
+        "has_discharge_enable_time": False,
+        "has_target_soc": True,
         "has_reserve_soc": False,
         "charge_time_format": "S",
         "charge_time_entity_is_option": False,
@@ -2924,20 +2936,18 @@ class Inverter:
             None
         """
         charge_power = self.base.get_arg("charge_rate", index=self.id, default=2600.0)
-        if current_charge_limit == 0:
-            self.alt_charge_discharge_enable("eco", True)  # ECO Mode
-        elif self.soc_percent > float(current_charge_limit):
+        if self.soc_percent > float(current_charge_limit):
             # If current SOC is above Target SOC, turn Grid Charging off
-            self.alt_charge_discharge_enable("charge", False)
+            self.alt_charge_discharge_enable("charge", False, grid=True, timed=True)
             self.base.log(f"Current SOC {self.soc_percent}% is greater than Target SOC {current_charge_limit}. Grid Charge disabled.")
         elif self.soc_percent == float(current_charge_limit):  # If SOC target is reached
-            self.alt_charge_discharge_enable("charge", True)  # Make sure charging is on
+            self.alt_charge_discharge_enable("charge", True, grid=True, timed=True)  # Make sure charging is on
             if self.inv_output_charge_control == "current":
                 self.set_current_from_power("charge", (0))  # Set charge current to zero (i.e hold SOC)
                 self.base.log(f"Current SOC {self.soc_percent}% is same as Target SOC {current_charge_limit}. Grid Charge enabled, Amps rate set to 0.")
         else:
             # If we drop below the target, turn grid charging back on and make sure the charge current is correct
-            self.alt_charge_discharge_enable("charge", True)
+            self.alt_charge_discharge_enable("charge", True, grid=True, timed=True)
             if self.inv_output_charge_control == "current":
                 self.set_current_from_power("charge", charge_power)  # Write previous current setting to inverter
                 self.base.log(f"Current SOC {self.soc_percent}% is less than Target SOC {current_charge_limit}. Grid Charge enabled, amp rate written to inverter.")
@@ -3619,44 +3629,59 @@ class Inverter:
         self.charge_start_time_minutes = self.base.forecast_minutes
         self.charge_end_time_minutes = self.base.forecast_minutes
 
-    def alt_charge_discharge_enable(self, direction, enable):
+    def alt_charge_discharge_enable(self, direction, enable, grid=True, timed=False):
         """
         Alternative enable and disable of timed charging for non-GE inverters
         """
+        if not grid and not timed:
+            self.base.log("WARN: Unable to set Solis Energy Controls Switch: both Grid and Timed are False")
+            return False
+
+        if enable:
+            str_enable = "enable"
+        else:
+            str_enable = "disable"
+
+        str_type = ""
+        if grid:
+            str_type += "grid "
+        if timed:
+            if grid:
+                str_type += "and "
+            str_type += "timed "
 
         if self.inverter_type == "GS":
             # Solis just has a single switch for both directions
             # Need to check the logic of how this is called if both charging and discharging
 
-            solax_modes = SOLAX_SOLIS_MODES_NEW if self.base.get_arg("solax_modbus_new", True) else SOLAX_SOLIS_MODES
+            modes_new = self.base.get_arg("solax_modbus_new", True)
+            solax_modes = SOLAX_SOLIS_MODES_NEW if modes_new else SOLAX_SOLIS_MODES
 
             entity_id = self.base.get_arg("energy_control_switch", indirect=False, index=self.id)
             entity = self.base.get_entity(entity_id)
             switch = solax_modes.get(entity.get_state(), 0)
-
-            if direction == "charge":
+            # Grid charging is Bit 1(2) and Timed Charging is Bit 5(32)
+            mask = 2 * timed + 32 * grid
+            if switch > 0:
+                # Timed charging is Bit 1 so we OR with 2 to set and AND with ~2 to clear
                 if enable:
-                    new_switch = 35
+                    new_switch = switch | mask
                 else:
-                    new_switch = 33
-            elif direction == "discharge":
-                if enable:
-                    new_switch = 35
+                    new_switch = switch & ~mask
+
+                if new_switch != switch:
+                    # Now lookup the new mode in an inverted dict:
+                    new_mode = {solax_modes[x]: x for x in solax_modes}[new_switch]
+
+                    self.base.log(f"Setting Solis Energy Control Switch to {new_switch} {new_mode} from {switch} to {str_enable} {str_type} charging")
+                    self.write_and_poll_option(name=entity_id, entity=entity, new_value=new_mode)
+                    return True
                 else:
-                    new_switch = 33
+                    self.base.log(f"Solis Energy Control Switch setting {switch} is correct for {str_enable} {str_type} charging")
+                    return True
             else:
-                # ECO
-                new_switch = 35
-
-            # Find mode names
-            old_mode = {solax_modes[x]: x for x in solax_modes}[switch]
-            new_mode = {solax_modes[x]: x for x in solax_modes}[new_switch]
-
-            if new_switch != switch:
-                self.base.log(f"Setting Solis Energy Control Switch to {new_switch} {new_mode} from {switch} {old_mode} for {direction} {enable}")
-                self.write_and_poll_option(name=entity_id, entity=entity, new_value=new_mode)
-            else:
-                self.base.log(f"Solis Energy Control Switch setting {switch} {new_mode} unchanged for {direction} {enable}")
+                self.base.log(f"WARN: Unable to read current value of Solis Mode switch {entity_id}. Unable to {str_enable} {str_type} charging")
+                return False
 
         # MQTT
         if direction == "charge" and enable:
@@ -6497,9 +6522,8 @@ class PredBat(hass.Hass):
                     or minute in self.manual_all_times
                     or rate_low_start in self.manual_all_times
                 ):
-                    rate_diff = abs(rate - rate_low_rate)
-                    if (rate_low_start >= 0) and rate_diff > self.combine_rate_threshold:
-                        # Refuse mixed rates that are different by more than threshold
+                    if (not self.combine_mixed_rates) and (rate_low_start >= 0) and (int(self.dp2(rate) + 0.5) != int(self.dp2(rate_low_rate) + 0.5)):
+                        # Refuse mixed rates that are different by more than 0.5p
                         rate_low_end = minute
                         break
                     if find_high and (not self.combine_discharge_slots) and (rate_low_start >= 0) and ((minute - rate_low_start) >= self.discharge_slot_split):
@@ -6621,8 +6645,8 @@ class PredBat(hass.Hass):
                 end_minutes = min(self.minutes_to_time(end, midnight), 24 * 60 - 1)
 
                 self.log(
-                    "Adding rate {}: {} => {} to {} @ {} date {} increment {}".format(
-                        rtype, this_rate, self.time_abs_str(start_minutes), self.time_abs_str(end_minutes), rate, date, rate_increment
+                    "Adding rate {} => {} to {} @ {} date {} increment {}".format(
+                        this_rate, self.time_abs_str(start_minutes), self.time_abs_str(end_minutes), rate, date, rate_increment
                     )
                 )
 
@@ -6716,7 +6740,6 @@ class PredBat(hass.Hass):
             start = max(window["start"], self.minutes_now)
             end = min(window["end"], ready_minutes)
             price = window["average"]
-
             length = 0
             kwh = 0
 
@@ -6743,12 +6766,15 @@ class PredBat(hass.Hass):
             # Clamp length to required amount (shorten the window)
             if kwh_add > kwh_left:
                 percent = kwh_left / kwh_add
-                length = min(round(((length * percent) / 5) + 0.5, 0) * 5, end - start)
+                length = min(int(((length * percent) / 5) + 0.5) * 5, end - start)
                 end = start + length
                 hours = length / 60
                 kwh = self.car_charging_rate[car_n] * hours
-                kwh_add = min(kwh * self.car_charging_loss, kwh_left)
-                kwh = kwh_add / self.car_charging_loss
+                kwh_add = kwh * self.car_charging_loss
+
+            # Work out how much to add to the battery, include losses
+            kwh_add = max(min(kwh_add, self.car_charging_limit[car_n] - car_soc), 0)
+            kwh = kwh_add / self.car_charging_loss
 
             # Work out charging amounts
             if kwh > 0:
@@ -10231,10 +10257,8 @@ class PredBat(hass.Hass):
                 if "$" in entity_id:
                     entity_id, attribute = entity_id.split("$")
                 try:
-                    self.log("Loading extra load forecast from {} attribute {}".format(entity_id, attribute))
                     data = self.get_state(entity_id=entity_id, attribute=attribute)
-                except (ValueError, TypeError) as e:
-                    self.log("Error: Unable to fetch load forecast data from sensor {} exception {}".format(entity_id, e))
+                except (ValueError, TypeError):
                     data = None
 
                 # Convert format from dict to array
@@ -10516,7 +10540,6 @@ class PredBat(hass.Hass):
         opts += "set_discharge_during_charge({}) ".format(self.set_discharge_during_charge)
         opts += "combine_charge_slots({}) ".format(self.combine_charge_slots)
         opts += "combine_discharge_slots({}) ".format(self.combine_discharge_slots)
-        opts += "combine_rate_threshold({}) ".format(self.combine_rate_threshold)
         opts += "best_soc_min({} kWh) ".format(self.best_soc_min)
         opts += "best_soc_max({} kWh) ".format(self.best_soc_max)
         opts += "best_soc_keep({} kWh) ".format(self.best_soc_keep)
@@ -11009,16 +11032,12 @@ class PredBat(hass.Hass):
 
                 # Avoid adjust avoid start time forward when it's already started
                 if (inverter.discharge_start_time_minutes < self.minutes_now) and (self.minutes_now >= minutes_start):
-                    minutes_start = inverter.discharge_start_time_minutes
-                    # Don't allow overlap with charge window
-                    if minutes_start >= inverter.charge_start_time_minutes and minutes_start < inverter.charge_end_time_minutes:
-                        minutes_start = window["start"]
-                    else:
-                        self.log(
-                            "Include original discharge start {} with our start which is {}".format(
-                                self.time_abs_str(inverter.discharge_start_time_minutes), self.time_abs_str(minutes_start)
-                            )
+                    self.log(
+                        "Include original discharge start {} with our start which is {}".format(
+                            self.time_abs_str(inverter.discharge_start_time_minutes), self.time_abs_str(minutes_start)
                         )
+                    )
+                    minutes_start = inverter.discharge_start_time_minutes
 
                 # Avoid having too long a period to configure as registers only support 24-hours
                 if (minutes_start < self.minutes_now) and ((minutes_end - minutes_start) >= 24 * 60):
@@ -11047,6 +11066,7 @@ class PredBat(hass.Hass):
                         if self.set_reserve_enable:
                             inverter.adjust_reserve(self.discharge_limits_best[0])
                             setReserve = True
+
                         status = "Discharging"
                         status_extra = " target {}%-{}%".format(inverter.soc_percent, self.discharge_limits_best[0])
                         if self.set_discharge_freeze:
@@ -11127,26 +11147,41 @@ class PredBat(hass.Hass):
 
             # Set the SOC just before or within the charge window
             if self.set_soc_enable:
-                if (
+                if isDischarging and not self.set_reserve_enable:
+                    # If we are discharging and not setting reserve then we should reset the target SOC to 0%
+                    # as some inverters can use this as a target for discharge
+                    inverter.adjust_battery_target(self.discharge_limits_best[0], False)
+                elif (
                     self.charge_limit_best
                     and (self.minutes_now < inverter.charge_end_time_minutes)
-                    and ((inverter.charge_start_time_minutes - self.minutes_now) <= self.set_soc_minutes)
+                    and ((inverter.charge_start_time_minutes - self.minutes_now) < self.set_soc_minutes)
                     and not (disabled_charge_window)
                 ):
-                    # In charge freeze hold the target SOC at the current value
-                    if self.set_charge_freeze and (self.charge_limit_best[0] == self.reserve):
-                        if isCharging:
-                            self.log("Within charge freeze setting target soc to current soc {}".format(inverter.soc_percent))
-                            inverter.adjust_battery_target(inverter.soc_percent, True)
+                    if inverter.inv_has_charge_enable_time or isCharging:
+                        # In charge freeze hold the target SOC at the current value
+                        if self.set_charge_freeze and (self.charge_limit_best[0] == self.reserve):
+                            if isCharging:
+                                self.log("Within charge freeze setting target soc to current soc {}".format(inverter.soc_percent))
+                                inverter.adjust_battery_target(inverter.soc_percent, True)
+                            else:
+                                # Not yet in the freeze, hold at 100% target SOC
+                                inverter.adjust_battery_target(100.0, False)
                         else:
-                            # Not yet in the freeze, hold at 100% target SOC
-                            inverter.adjust_battery_target(100.0, False)
+                            # If not charging and not hybrid we should reset the target % to 100 to avoid losing solar
+                            if not self.inverter_hybrid and self.inverter_soc_reset and not isCharging:
+                                inverter.adjust_battery_target(100.0, False)
+                            else:
+                                inverter.adjust_battery_target(self.charge_limit_percent_best[0], isCharging)
                     else:
-                        # If not charging and not hybrid we should reset the target % to 100 to avoid losing solar
-                        if not self.inverter_hybrid and self.inverter_soc_reset and not isCharging:
+                        if not inverter.inv_has_target_soc:
+                            # If the inverter doesn't support target soc and soc_enable is on then do that logic here:
+                            inverter.mimic_target_soc(0)
+                        elif not self.inverter_hybrid and self.inverter_soc_reset:
+                            # AC Coupled, charge to 0 on solar
                             inverter.adjust_battery_target(100.0, False)
                         else:
-                            inverter.adjust_battery_target(self.charge_limit_percent_best[0], isCharging)
+                            # Hybrid, no charge timer, set target soc back to 0
+                            inverter.adjust_battery_target(0, False)
                 else:
                     if not inverter.inv_has_target_soc:
                         # If the inverter doesn't support target soc and soc_enable is on then do that logic here:
@@ -11179,6 +11214,8 @@ class PredBat(hass.Hass):
                                 self.time_abs_str(self.minutes_now), self.set_soc_minutes, self.time_abs_str(inverter.charge_start_time_minutes)
                             )
                         )
+                        if not inverter.inv_has_charge_enable_time:
+                            inverter.adjust_battery_target(0, False)
 
             # If we should set reserve during charging
             if self.set_soc_enable and self.set_reserve_enable and not setReserve:
@@ -11410,10 +11447,6 @@ class PredBat(hass.Hass):
                 self.log("Error: metric_octopus_gas is not set correctly or no energy rates can be read")
                 self.record_status(message="Error - rate_import_gas not set correctly or no energy rates can be read", had_errors=True)
                 raise ValueError
-            self.rate_gas, self.rate_gas_replicated = self.rate_replicate(self.rate_gas, is_import=False, is_gas=False)
-            self.rate_gas = self.rate_scan_gas(self.rate_gas, print=True)
-        elif "rates_gas" in self.args:
-            self.rate_gas = self.basic_rates(self.get_arg("rates_gas", [], indirect=False), "gas")
             self.rate_gas, self.rate_gas_replicated = self.rate_replicate(self.rate_gas, is_import=False, is_gas=False)
             self.rate_gas = self.rate_scan_gas(self.rate_gas, print=True)
 
@@ -12050,7 +12083,7 @@ class PredBat(hass.Hass):
         self.get_car_charging_planned()
         self.load_inday_adjustment = 1.0
 
-        self.combine_rate_threshold = self.get_arg("combine_rate_threshold")
+        self.combine_mixed_rates = False
         self.combine_discharge_slots = self.get_arg("combine_discharge_slots")
         self.combine_charge_slots = self.get_arg("combine_charge_slots")
         self.charge_slot_split = 60
