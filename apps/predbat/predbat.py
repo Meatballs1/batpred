@@ -1,4 +1,4 @@
-"""
+:q"""
 Battery Prediction app
 see Readme for information
 """
@@ -23,9 +23,9 @@ import requests
 import yaml
 from multiprocessing import Pool, cpu_count
 
-from version import THIS_VERSION
-from const import *
-from inverter_const import *
+from predbat_version import THIS_VERSION
+from predbat_const import *
+from predbat_inverter_const import *
 
 # Only assign globals once to avoid re-creating them with processes are forked
 if not "PRED_GLOBAL" in globals():
