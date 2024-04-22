@@ -5,6 +5,10 @@
 pred_bat:
   module: predbat
   class: PredBat
+  dependencies:
+    - predbat_version
+    - predbat_const
+    - predbat_inverter_const
 
   # Sets the prefix for all created entities in HA - only change if you want to run more than once instance
   prefix: predbat
@@ -418,3 +422,14 @@ pred_bat:
   #  - '+[car_charging_planned]'
   #  - '+[car_charging_soc]'
   #  - '{car_charging_now}'
+
+predbat_const_global module:
+  module: predbat_const
+  global: true
+  dependencies: predbat_version
+predbat_inverter_const_global module:
+  module: predbat_inverter_const
+  global: true
+predbat_version_global module:
+  module: predbat_version
+  global: true
